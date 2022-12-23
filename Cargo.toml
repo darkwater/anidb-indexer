@@ -1,21 +1,21 @@
 [package]
-name = "tetsu-anidb"
+name = "anidb-indexer"
 version = "0.1.0"
-authors = ["Sam Lakerveld <dark@dark.red>"]
+authors = [ "Sam Lakerveld <dark@dark.red>" ]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-futures = "0.3.8"
-log = "0.4.11"
-md4 = "0.10.2"
-memmap = "0.7.0"
+anyhow            = "1.0.68"
+clap              = { version = "4.0.32", features = [ "derive" ] }
+indicatif = { version = "0.17.2", features = ["rayon", "tokio"] }
+log               = "0.4.11"
+md4               = "0.10.2"
+memmap            = "0.7.0"
 pretty_env_logger = "0.4.0"
-ranidb = { path = "../ranidb" }
-rayon = "1.5.0"
-rusqlite = "0.28.0"
-serde_json = "1.0"
-structopt = "0.3"
-tokio-util = { version = "0.7.4", features = [ "codec" ] }
-tokio = { version = "1.23.0", features = [ "rt-multi-thread", "macros", "fs" ] }
+ranidb            = { path = "../ranidb" }
+rayon             = "1.5.0"
+rusqlite          = "0.28.0"
+serde_json        = "1.0"
+tokio             = { version = "1.23.0", features = [ "rt-multi-thread", "macros", "fs" ] }

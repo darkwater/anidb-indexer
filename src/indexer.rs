@@ -1,18 +1,26 @@
+use std::{fs::File, path::Path, time::Duration};
+
+use anyhow::{Context, Result};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use md4::{Digest, Md4};
 use memmap::Mmap;
 use ranidb::AniDb;
 use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 use rusqlite::params;
-use std::{fs::File, path::Path};
 use tokio::fs;
 
-fn ed2k_hash(file: &File) -> std::io::Result<[u8; 16]> {
+const ED2K_CHUNK_SIZE: usize = 9728000;
+
+fn ed2k_hash(file: &File, pb: &ProgressBar) -> std::io::Result<[u8; 16]> {
     let map = unsafe { Mmap::map(file) }?;
 
+    pb.set_length(map.len() as u64 / ED2K_CHUNK_SIZE as u64);
+
     let hashes: Vec<[u8; 16]> = map
-        .par_chunks(9728000)
+        .par_chunks(ED2K_CHUNK_SIZE)
         .map(Md4::digest)
         .map(Into::into)
+        .inspect(|_| pb.inc(1))
         .collect();
 
     let root_hash = Md4::digest(hashes.concat());
@@ -20,8 +28,8 @@ fn ed2k_hash(file: &File) -> std::io::Result<[u8; 16]> {
     Ok(root_hash.into())
 }
 
-fn init_database(db_path: &Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(db_path).expect("failed to open db");
+fn init_database(db_path: &Path) -> Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path).context("failed to open db")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS anime (
@@ -49,8 +57,7 @@ fn init_database(db_path: &Path) -> rusqlite::Connection {
             parody_count        INTEGER
         )",
         params![],
-    )
-    .unwrap();
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS episodes (
@@ -69,8 +76,7 @@ fn init_database(db_path: &Path) -> rusqlite::Connection {
             FOREIGN KEY (aid) REFERENCES anime (aid)
         )",
         params![],
-    )
-    .unwrap();
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
@@ -100,8 +106,7 @@ fn init_database(db_path: &Path) -> rusqlite::Connection {
             FOREIGN KEY (gid) REFERENCES groups (gid)
         )",
         params![],
-    )
-    .unwrap();
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS groups (
@@ -124,8 +129,7 @@ fn init_database(db_path: &Path) -> rusqlite::Connection {
             grouprelations      TEXT
         )",
         params![],
-    )
-    .unwrap();
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS indexed_files (
@@ -138,10 +142,9 @@ fn init_database(db_path: &Path) -> rusqlite::Connection {
             FOREIGN KEY (fid) REFERENCES files (fid)
         )",
         params![],
-    )
-    .unwrap();
+    )?;
 
-    conn
+    Ok(conn)
 }
 
 struct CachedFacade<'a> {
@@ -155,7 +158,7 @@ macro_rules! simple_cache {
         $questionmarks:literal:
         $($field:ident,)*
     ) => {
-        async fn $funname(&mut self, id: u32) -> ranidb::$funret {
+        async fn $funname(&mut self, id: u32) -> Result<ranidb::$funret> {
             let cached =
                 self.conn
                     .query_row(
@@ -173,14 +176,14 @@ macro_rules! simple_cache {
             if let Ok(hit) = cached {
                 log::debug!("found in cache");
 
-                hit
+                Ok(hit)
             }
             else {
                 let live = self
                     .anidb
                     .$ranidbfun(id)
                     .await
-                    .expect("failed to get info");
+                    .context("failed to get info")?;
 
                 self.conn
                     .execute(
@@ -189,9 +192,9 @@ macro_rules! simple_cache {
                             $( &live.$field, )*
                         ],
                     )
-                    .expect("failed to store item");
+                    .context("failed to store item")?;
 
-                live
+                Ok(live)
             }
         }
     };
@@ -224,7 +227,7 @@ impl<'a> CachedFacade<'a> {
             foundeddate, disbandeddate, dateflags, lastreleasedate, lastactivitydate, grouprelations,
     }
 
-    async fn get_file(&mut self, path: &Path) -> Option<ranidb::File> {
+    async fn get_file(&mut self, path: &Path, pb: &ProgressBar) -> Result<Option<ranidb::File>> {
         let fid: Option<(u32, String)> = self
             .conn
             .query_row(
@@ -262,12 +265,16 @@ impl<'a> CachedFacade<'a> {
             );
 
             if indexed_path != path.to_string_lossy() {
-                self.conn.execute("UPDATE indexed_files SET path = ? WHERE path = ?", params![
-                    &path.to_string_lossy(), &indexed_path
-                ]).unwrap();
+                self.conn
+                    .execute("UPDATE indexed_files SET path = ? WHERE path = ?", params![
+                        &path.to_string_lossy(),
+                        &indexed_path
+                    ])
+                    .unwrap();
             }
 
-            self.conn
+            Ok(self
+                .conn
                 .query_row("SELECT * FROM files WHERE fid = ?;", [fid], |row| {
                     Ok(ranidb::File {
                         fid: row.get(0)?,
@@ -292,9 +299,8 @@ impl<'a> CachedFacade<'a> {
                         aired_date: row.get(19)?,
                     })
                 })
-                .ok()
-        }
-        else {
+                .ok())
+        } else {
             let file = File::open(path).expect("opening file");
             let size = file.metadata().expect("metadata").len();
 
@@ -302,12 +308,14 @@ impl<'a> CachedFacade<'a> {
 
             let ed2k = format!(
                 "{:032x}",
-                u128::from_be_bytes(ed2k_hash(&file).expect("failed to hash"))
+                u128::from_be_bytes(ed2k_hash(&file, pb).context("failed to hash")?)
             );
 
             let file = match self.anidb.file_by_ed2k(size, &ed2k).await {
                 Ok(file) => file,
-                Err(ranidb::Error::AniDb(ranidb::responses::Error::Other(320, _))) => return None,
+                Err(ranidb::Error::AniDb(ranidb::responses::Error::Other(320, _))) => {
+                    return Ok(None)
+                }
                 e => panic!("failed to get file info: {:?}", e),
             };
 
@@ -341,12 +349,12 @@ impl<'a> CachedFacade<'a> {
                 .expect("failed to store file");
 
             self.conn
-                .execute(
-                    "INSERT OR REPLACE INTO indexed_files VALUES (?, ?, ?, ?)",
-                    params![
-                        &path.to_string_lossy(),
-                        &path.file_name().unwrap_or_default().to_string_lossy(),
-                        &path.metadata().map(|f| {
+                .execute("INSERT OR REPLACE INTO indexed_files VALUES (?, ?, ?, ?)", params![
+                    &path.to_string_lossy(),
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    &path
+                        .metadata()
+                        .map(|f| {
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::MetadataExt;
@@ -361,19 +369,19 @@ impl<'a> CachedFacade<'a> {
 
                             #[cfg(not(any(unix, windows)))]
                             -1
-                        }).unwrap_or_default(),
-                        &file.fid
-                    ],
-                )
+                        })
+                        .unwrap_or_default(),
+                    &file.fid
+                ])
                 .expect("failed to store indexed file");
 
-            Some(file)
+            Ok(Some(file))
         }
     }
 }
 
-pub(crate) async fn index(path: &Path, db_path: &Path) {
-    let mut conn = init_database(db_path);
+pub(crate) async fn index(path: &Path, db_path: &Path) -> Result<()> {
+    let mut conn = init_database(db_path)?;
 
     let mut anidb = AniDb::new("tetsu", 1);
 
@@ -386,48 +394,129 @@ pub(crate) async fn index(path: &Path, db_path: &Path) {
 
     let mut facade = CachedFacade::new(&mut anidb, &mut conn);
 
+    let mpb = MultiProgress::new();
+
     let mut dirs = vec![path.to_owned()];
+    let mut files = vec![];
+
+    let overall_style = ProgressStyle::default_bar()
+        .progress_chars("== ")
+        .template("[{elapsed_precise}] [{bar:32.cyan/blue}] [{eta:.yellow}] {pos:.green}/{len:.blue} {wide_msg}")
+        .unwrap();
+
+    let file_style = ProgressStyle::default_bar()
+        .progress_chars("== ")
+        .template("[{elapsed_precise}] [{bar:32.cyan/blue}] {spinner:.green} {wide_msg}")
+        .unwrap();
+
+    let overall = mpb.add(ProgressBar::new(0));
+    // overall.enable_steady_tick(Duration::from_millis(125));
+    overall.set_style(overall_style);
+    overall.set_message("Building file list...");
+
     while let Some(dir) = dirs.pop() {
         let mut rd = fs::read_dir(dir).await.unwrap();
         while let Some(entry) = rd.next_entry().await.unwrap() {
             let path = entry.path();
             if path.is_dir() {
                 dirs.push(path);
-            }
-            else {
-                log::debug!("indexing {}...", path.display());
-
-                if let Some(file) = facade.get_file(&path).await {
-                    log::debug!("file: {:#?}", file);
-
-                    let anime = facade.get_anime(file.aid).await;
-                    log::debug!("anime: {:#?}", anime);
-
-                    let episode = facade.get_episode(file.eid).await;
-                    log::debug!("episode: {:#?}", episode);
-
-                    let group = facade.get_group(file.gid).await;
-                    log::debug!("group: {:#?}", group);
-                }
+            } else {
+                files.push(path);
+                overall.inc_length(1);
             }
         }
     }
 
+    overall.reset_eta();
+    overall.set_message("Indexing files...");
+
+    for file_path in files {
+        let size = fs::metadata(&file_path).await.unwrap().len() / 1024;
+
+        let pb = mpb.insert_before(&overall, ProgressBar::new(size));
+        pb.enable_steady_tick(Duration::from_millis(125));
+        pb.set_style(file_style.clone());
+        pb.set_message(
+            file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        if let Some(file) = facade
+            .get_file(&file_path, &pb)
+            .await
+            .context("failed to get file")?
+        {
+            log::debug!("file: {:#?}", file);
+
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("[{elapsed_precise}] {spinner:.green} {wide_msg:.green}")
+                    .unwrap(),
+            );
+
+            pb.set_message("Getting anime info...");
+
+            let anime = facade.get_anime(file.aid).await;
+            log::debug!("anime: {:#?}", anime);
+
+            let anime_name = anime
+                .as_ref()
+                .map(|a| a.romaji_name.as_str())
+                .unwrap_or("Unknown");
+
+            pb.set_message(anime_name.to_string());
+
+            let episode = facade.get_episode(file.eid).await;
+            log::debug!("episode: {:#?}", episode);
+
+            let episode_number = episode.as_ref().map(|e| e.epno.as_str()).unwrap_or("??");
+
+            pb.set_message(format!("{anime_name} - {episode_number}"));
+
+            let group = facade.get_group(file.gid).await;
+            log::debug!("group: {:#?}", group);
+
+            let group_name = group.as_ref().map(|g| g.name.as_str()).unwrap_or("Unknown");
+
+            pb.set_message(format!("{anime_name} - {episode_number} [{group_name}]"));
+        } else {
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("[{elapsed_precise}] {spinner:.green} {wide_msg:.yellow}")
+                    .unwrap(),
+            );
+
+            pb.set_message(format!("Not found: {}", file_path.display()));
+        }
+
+        overall.inc(1);
+        pb.finish();
+    }
+
+    overall.finish_with_message("Done!");
+
     {
         let mut stmt = conn.prepare("SELECT path FROM indexed_files;").unwrap();
-        let indexed_files = stmt.query_map(params![], |row| {
-            row.get::<_, String>(0)
-        }).unwrap();
+        let indexed_files = stmt
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .unwrap();
 
-        let mut del_stmt = conn.prepare("DELETE FROM indexed_files WHERE path = ?;").unwrap();
+        let mut del_stmt = conn
+            .prepare("DELETE FROM indexed_files WHERE path = ?;")
+            .unwrap();
         for path in indexed_files {
             let path = path.unwrap();
             if !Path::new(path.as_str()).exists() {
                 log::info!("deleting {} from index", path);
-                del_stmt.execute([ path ]).unwrap();
+                del_stmt.execute([path]).unwrap();
             }
         }
     }
 
     anidb.logout().await.expect("failed logout");
+
+    Ok(())
 }
