@@ -15,7 +15,7 @@ fn ed2k_hash(file: &File) -> std::io::Result<[u8; 16]> {
         .map(Into::into)
         .collect();
 
-    let root_hash = Md4::digest(&hashes.concat());
+    let root_hash = Md4::digest(hashes.concat());
 
     Ok(root_hash.into())
 }
@@ -162,8 +162,7 @@ macro_rules! simple_cache {
                         concat!("SELECT * FROM ", $tablename, " WHERE ", $idx, " = ?;"),
                         &[&id],
 
-                        // clippy doesn't detect this properly
-                        #[allow(clippy::eval_order_dependence, unused_assignments)]
+                        #[allow(unused_assignments)] // last `n` increment is unused
                         |row| {
                             let mut n = 0;
                             Ok(ranidb::$funret {
@@ -237,13 +236,13 @@ impl<'a> CachedFacade<'a> {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::MetadataExt;
-                            return f.size() as i64;
+                            f.size() as i64
                         }
 
                         #[cfg(windows)]
                         {
                             use std::os::windows::fs::MetadataExt;
-                            return f.file_size() as i64;
+                            f.file_size() as i64
                         }
 
                         #[cfg(not(any(unix, windows)))]
@@ -269,7 +268,7 @@ impl<'a> CachedFacade<'a> {
             }
 
             self.conn
-                .query_row("SELECT * FROM files WHERE fid = ?;", &[&fid], |row| {
+                .query_row("SELECT * FROM files WHERE fid = ?;", [fid], |row| {
                     Ok(ranidb::File {
                         fid: row.get(0)?,
                         aid: row.get(1)?,
@@ -351,13 +350,13 @@ impl<'a> CachedFacade<'a> {
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::MetadataExt;
-                                return f.size() as i64;
+                                f.size() as i64
                             }
 
                             #[cfg(windows)]
                             {
                                 use std::os::windows::fs::MetadataExt;
-                                return f.file_size() as i64;
+                                f.file_size() as i64
                             }
 
                             #[cfg(not(any(unix, windows)))]
@@ -425,7 +424,7 @@ pub(crate) async fn index(path: &Path, db_path: &Path) {
             let path = path.unwrap();
             if !Path::new(path.as_str()).exists() {
                 log::info!("deleting {} from index", path);
-                del_stmt.execute(&[ &path ]).unwrap();
+                del_stmt.execute([ path ]).unwrap();
             }
         }
     }

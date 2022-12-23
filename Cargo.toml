@@ -9,13 +9,13 @@ edition = "2018"
 [dependencies]
 futures = "0.3.8"
 log = "0.4.11"
-md4 = "0.9.0"
+md4 = "0.10.2"
 memmap = "0.7.0"
 pretty_env_logger = "0.4.0"
 ranidb = { path = "../ranidb" }
 rayon = "1.5.0"
-rusqlite = "0.24.2"
+rusqlite = "0.28.0"
 serde_json = "1.0"
 structopt = "0.3"
-tokio-util = { version = "0.5.1", features = [ "codec" ] }
-tokio = { version = "0.3.6", features = [ "full" ] }
+tokio-util = { version = "0.7.4", features = [ "codec" ] }
+tokio = { version = "1.23.0", features = [ "rt-multi-thread", "macros", "fs" ] }
